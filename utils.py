@@ -14,7 +14,9 @@ from datasets import Dataset
 from gensim.models import FastText
 
 from abc import ABC, abstractmethod
-from enum import Enum
+
+import torch.utils
+import torch.utils.data
 
 
 class DataMapper(ABC):
@@ -24,31 +26,6 @@ class DataMapper(ABC):
 
     def __call__(self, *args, **kwargs):
         return self.map(*args, **kwargs)
-
-
-class POSTagger(DataMapper):
-    def __init__(self, corpora):
-        self._corpora = corpora
-
-    def map(self, text):
-        return nltk.pos_tag(text)
-    
-
-class WordGramMapper(DataMapper):
-    def __init__(self):
-        pass
-
-    def map(self, text, n=2):
-        return list(nltk.ngrams(text, n))
-    
-    
-class CharacterGramMapper(DataMapper):
-    def __init__(self):
-        pass
-
-    def map(self, text, n=3):
-        chars = [char for word in text for char in word]
-        return list(nltk.ngrams(chars, n))
     
 
 class TextDistorter(DataMapper):
@@ -157,6 +134,15 @@ class Embeddings(ABC):
     def get_weights_tensor(self):
         pass
 
+    def word2vec(self, word):
+        return self[word]
+    
+    def sentence2vec(self, sentence):
+        return [self[word] for word in sentence]
+    
+    def doc2vec(self, doc):
+        return [self.sentence2vec(sentence) for sentence in doc]
+
 
 class CustomFastTextEmbeddings(Embeddings):
     def __init__(self, vocab_size=10000, embedding_size = 300):
@@ -178,14 +164,15 @@ class CustomFastTextEmbeddings(Embeddings):
         ft._model = FastText.load(input)
         return ft
 
-    def train(self, corpus, output=None):
+    def train(self, corpus, epochs=10):
         self._model.build_vocab(corpus)
-        self._model.train(corpus, total_examples=self._model.corpus_count, epochs=10)
-        if output is not None:
-            self._model.save(output)
+        self._model.train(corpus, total_examples=self._model.corpus_count, epochs=epochs)
+
+    def save(self, output):
+        self._model.save(output)
 
     def __getitem__(self, token):
-        return self._model[token]
+        return self._model.wv[token]
     
     def get_weights_tensor(self):
         weights = torch.zeros(self._model.wv.vectors.shape[0], self._model.wv.vectors.shape[1])
@@ -209,7 +196,7 @@ class FastTextEmbeddings(Embeddings):
         return weights
 
 
-class Corpus:
+class Corpus():
     def __init__(self, max_sent_len=50, max_doc_len=50, vocab_size=10000):
         self._vocab_size = vocab_size
         self._max_sent_len = max_sent_len
@@ -259,7 +246,8 @@ class Corpus:
             if not isinstance(doc, str):
                 doc = ""
             doc = self._preprocess_doc(doc)
-            doc = self._pad(doc)
+            doc = self._pad_sentences(doc)
+            doc = self._pad_doc(doc)
             self._docs_L.append(doc)
         
         self._docs_R = []
@@ -267,7 +255,8 @@ class Corpus:
             if not isinstance(doc, str):
                 doc = ""
             doc = self._preprocess_doc(doc)
-            doc = self._pad(doc)
+            doc = self._pad_sentences(doc)
+            doc = self._pad_doc(doc)
             self._docs_R.append(doc)
         
         self._labels = df_labels.tolist()
@@ -291,15 +280,18 @@ class Corpus:
         return train, test
     
     @property
-    def dataset(self):
-        return Dataset.from_dict({
-            "doc_L": self._docs_L,
-            "doc_R": self._docs_R,
-            "label": self._labels
-        })
+    def docs(self):
+        return self._docs_L, self._docs_R
+    
+    @property
+    def labels(self):
+        return self._labels
     
     def get_all_docs(self):
         return self._docs_L + self._docs_R
+    
+    def get_all_sentences(self):
+        return [sent for doc in self.get_all_docs() for sent in doc]
 
     def _preprocess_doc(self, doc):
         doc = tp.normalize.whitespace(doc)
@@ -311,7 +303,7 @@ class Corpus:
 
         return doc     
 
-    def _pad(self, doc):
+    def _pad_sentences(self, doc):
         return pad_sequences(
             doc, 
             maxlen=self._max_sent_len, 
@@ -320,6 +312,13 @@ class Corpus:
             dtype=object,
             value="<PAD>"
         ).tolist()
+    
+    def _pad_doc(self, doc):
+        if len(doc) < self._max_doc_len:
+            doc = doc + [['<PAD>'] * self._max_sent_len] * (self._max_doc_len - len(doc))
+        else:
+            doc = doc[:self._max_doc_len]
+        return doc
 
     def _add_special_tokens(self, doc):
         result = []
@@ -352,13 +351,20 @@ class Corpus:
                     self._char_vocab.add(token)
 
 
-# ft = FastTextEmbeddings.load()
-# print(ft["hello"])
-# print(ft[","])
-# print(ft["<UNK>"])
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, corpus: Corpus, embeddings: Embeddings):    
+        self._docs_L, self._docs_R = corpus.docs
+        self._labels = corpus.labels
 
-# corpus = Corpus()
-# corpus.open("data/dev.csv")
-# print(corpus._docs_L[0])
-# print(type(corpus._docs_L))
-# corpus.save("data/dev.json")
+        self._docs_L = np.array(map(lambda x: embeddings.doc2vec(x), self._docs_L))
+        self._docs_R = np.array(map(lambda x: embeddings.doc2vec(x), self._docs_R))
+
+    def __len__(self):
+        return len(self._docs_L)
+
+    def __getitem__(self, idx):
+        return {
+            "doc_L": self._docs_L[idx],
+            "doc_R": self._docs_R[idx],
+            "label": self._labels[idx]
+        }
